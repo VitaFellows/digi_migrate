@@ -1,0 +1,26 @@
+# System / OS
+.DS_Store
+Thumbs.db
+
+# Secrets & Environment variables
+.env
+*.env
+
+# Cache / Virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# IDE / Tool settings
+.claude/
+.idea/
+.vscode/
+
+# Patient / Migration Data files
+*.csv
+*.xlsx
+*.json
+output/
+**/output/

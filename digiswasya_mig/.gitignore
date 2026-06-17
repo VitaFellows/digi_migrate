@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+
+# Secrets — never commit
+.env
+*.env
+
+# Patient data / PHI and migration data artifacts — never commit
+*.csv
+*.xlsx
+output/
+*_snapshot_before.json
+*_snapshot_after.json
+patient_id_map_*.json
+deleted_*.json
+backfill_*.json
+native_*.json
+*_report.csv
