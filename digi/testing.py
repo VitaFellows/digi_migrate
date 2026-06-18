@@ -170,7 +170,19 @@ def my_row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
             if extra not in enhanced_candidates:
                 enhanced_candidates.append(extra)
 
-    res = original_row_lookup(row, *enhanced_candidates, default=default)
+    # Filter out short candidates (< 3 chars normalized) unless they are an exact normalized match in row keys.
+    # This avoids false positive substring matches in original_row_lookup fallback.
+    normalized_row_keys = {"".join(ch for ch in str(k).lower() if k is not None and ch.isalnum()) for k in row.keys()}
+    filtered_candidates = []
+    for c in enhanced_candidates:
+        c_norm = "".join(ch for ch in str(c).lower() if c is not None and ch.isalnum())
+        if len(c_norm) < 3:
+            if c_norm in normalized_row_keys:
+                filtered_candidates.append(c)
+        else:
+            filtered_candidates.append(c)
+
+    res = original_row_lookup(row, *filtered_candidates, default=default)
     
     # If UID lookup failed, check Unnamed: 0 or other unnamed columns
     if is_uid and (res is None or str(res).strip() == "" or pd.isna(res)):
@@ -443,6 +455,10 @@ def _read_config() -> DbConfig:
                 encoded_password = urllib.parse.quote(password)
                 database_url = f"{prefix}://{user}:{encoded_password}@{host_part}"
 
+    # Auto-route to port 6543 (PgBouncer connection pooler) for stability if direct port 5432 is used
+    if ":5432/" in database_url:
+        database_url = database_url.replace(":5432/", ":6543/")
+
     env_excel_path = os.getenv("INPUT_EXCEL_PATH")
     env_workbook_path = os.getenv("MIGRATION_WORKBOOK_PATH")
     
@@ -564,13 +580,31 @@ def _resolve_center_row_for_sheet(center_rows: list[dict[str, Any]], sheet_ref: 
     if not center_rows:
         return None
     if isinstance(sheet_ref, str):
-        stripped = sheet_ref.strip()
-        # Special fallback mapping for Bihar sheet
-        if stripped.lower() == "bihar":
+        explicit_mappings = {
+            "gorewada": "DS-TMC-005",
+            "jagnath budhwari": "DS-TMC-006",
+            "igr": "DS-TMC-007",
+            "chinchbhavan": "DS-TMC-008",
+            "narsala": "DS-TMC-009",
+            "hasanbagh": "DS-TMC-010",
+            "chakole": "DS-TMC-011",
+            "bharatwada": "DS-TMC-012",
+            "peth": "DS-TMC-013",
+            "rajgurunagar": "DS-TMC-014",
+            "karanjawane": "DS-TMC-015",
+            "itaunja": "DS-TMC-004",
+            "kathaicha": "DS-TMC-001",
+            "bihar": "DS-TMC-002",
+            "ashrafpur": "DS-TMC-003"
+        }
+        ref_lower = sheet_ref.strip().lower()
+        if ref_lower in explicit_mappings:
+            target_code = explicit_mappings[ref_lower]
             for row in center_rows:
-                name = str(row.get("name", "")).lower()
-                if "sahebganj" in name:
+                if str(row.get("center_code", "")).strip().upper() == target_code.upper():
                     return row
+
+        stripped = sheet_ref.strip()
         if stripped.isdigit():
             index = int(stripped)
             if 0 <= index < len(center_rows):
@@ -1213,8 +1247,18 @@ def main():
     # collision_start, collision_end = _get_collision_range(COLLISION_START_DATE_STR, COLLISION_END_DATE_STR)
     print("Running in full update/skip testing mode: all rows are processed for update checks regardless of date.")
 
-    print(f"Connecting to database at {cfg.database_url.split('@')[-1]}...")
-    engine = create_engine(cfg.database_url, pool_pre_ping=True)
+    engine = create_engine(
+        cfg.database_url,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        connect_args={
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "connect_timeout": 10,
+        },
+    )
 
     stats = {
         "migration_status": "STARTED",
@@ -1251,7 +1295,7 @@ def main():
 
     # Pre-flight metadata fetch
     try:
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             print("\n[1/5] Fetching live metadata from Supabase database...")
             
             # Centers
@@ -1330,6 +1374,8 @@ def main():
     excel_duplicates_dropped = 0
     date_filtered_rows_dropped = 0
     
+    missing_uid_counter = 45660  # Start sequential counter for rows missing UID
+    
     for sheet_name in sheets_to_process:
         print(f"\n   --- Processing sheet: '{sheet_name}' ---")
         if hasattr(excel_source, "seek"):
@@ -1353,11 +1399,10 @@ def main():
         uid_column = _find_column(sheet_df, "UID", "ma ", "CONSULTATION ID", "CONSULTATION ID\n", "CONSULTATION ID\nDS1", "CONSULTATION ID\nDS5", "PATIENT ID", "Id", "ID", "Unnamed: 0")
         if uid_column is not None:
             uid_mask = sheet_df[uid_column].apply(lambda value: not pd.isna(value) and str(value).strip() != "")
-            dropped = int((~uid_mask).sum())
-            if dropped:
-                print(f"      Dropped {dropped} rows missing UID values in column '{uid_column}'.")
-                blank_uids_dropped += dropped
-            sheet_df = sheet_df.loc[uid_mask].copy()
+            missing_count = int((~uid_mask).sum())
+            if missing_count:
+                print(f"      Note: {missing_count} rows are missing UID values in column '{uid_column}'. These will be processed with generated tracking IDs and nullable legacy_id.")
+            # Do NOT filter/drop the rows; process them all.
         else:
             print(f"      [WARNING] Could not identify a UID/Consultation ID column for sheet '{sheet_name}'.")
             
@@ -1418,7 +1463,9 @@ def main():
             raw_date = _row_lookup(raw, "DATE", "Date")
             uid = resolve_uid(raw)
             if not uid:
-                uid = f"unassigned_{uuid.uuid4().hex[:8]}"
+                uid = str(missing_uid_counter)
+                missing_uid_counter += 1
+                patient_row["legacy_id"] = uid
             
             custom_gov_id = generate_custom_government_id(patient_row.get("full_name"), raw_age, raw_date, uid)
             patient_row["government_id"] = custom_gov_id
@@ -1453,7 +1500,7 @@ def main():
 
     def process_patient_batch(batch, start_idx):
         nonlocal inserted_patients, updated_patients_count
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             for idx, item in enumerate(batch, start=start_idx):
                 uid = item["uid"]
                 patient_row = item["patient_row"]
@@ -1521,8 +1568,10 @@ def main():
                         "detail": f"Patient '{patient_row.get('full_name')}' not found in database. Registered new patient with ID: {inserted_id}"
                     })
                     
-                if idx % 100 == 0 or idx == len(excel_row_data):
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} patients...")
+            conn.commit()
 
     try:
         # Process first 5 records
@@ -1562,7 +1611,7 @@ def main():
 
     except Exception as exc:
         print(f"\n[ERROR] CRITICAL ERROR OCCURRED during Patient Migration: {exc}")
-        print("Patient transaction has been rolled back. No changes were committed.")
+        print("Patient changes up to the last successful batch commit remain in the database.")
         stats["migration_status"] = f"FAILED_PHASE_A: {type(exc).__name__}"
         migration_log.append({
             "uid": "SYSTEM",
@@ -1621,7 +1670,7 @@ def main():
 
     def process_phase_b_batch(batch, start_idx):
         nonlocal inserted_visits, skipped_visits, inserted_rx, skipped_rx, inserted_items, skipped_items, inserted_followups, skipped_followups
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             # --- LOOP 1: VISITS ---
             print(f"\nMigrating 'visit' table for batch starting at index {start_idx}...")
             for offset, item in enumerate(batch):
@@ -1645,6 +1694,8 @@ def main():
                     center_id=item["resolved_center_id"], 
                     created_by_user_id=item["created_by_user_id"]
                 )
+                if not resolve_uid(raw):
+                    visit_row["legacy_id"] = item["uid"]
                 
                 # Validate NOT NULL fields
                 _validate_not_null_fields(
@@ -1708,8 +1759,10 @@ def main():
                     inserted_visits += 1
                     stats["visits_inserted"] += 1
                     
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} visits...")
+            conn.commit()
             print(f"      Visits complete: {inserted_visits} new, {skipped_visits} skipped.")
             
             # --- LOOP 2: PRESCRIPTIONS ---
@@ -1732,6 +1785,8 @@ def main():
                     raw.get("DATE", raw.get("Date")), 
                     migration_log
                 )
+                if not resolve_uid(raw):
+                    rx_row["legacy_id"] = item["uid"]
                 
                 _validate_not_null_fields(
                     "prescription",
@@ -1777,8 +1832,10 @@ def main():
                     inserted_rx += 1
                     stats["prescriptions_inserted"] += 1
                     
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} prescriptions...")
+            conn.commit()
             print(f"      Prescriptions complete: {inserted_rx} new, {skipped_rx} skipped.")
 
             # --- LOOP 3: PRESCRIPTION ITEMS ---
@@ -1832,8 +1889,10 @@ def main():
                             "detail": f"Item '{item_row.get('medication_name')}' matched {len(matched_item_ids)} database records by Prescription + Name + Details. Skipping update."
                         })
                         
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} medication lists...")
+            conn.commit()
             print(f"      Medication Items complete: {inserted_items} new, {skipped_items} skipped.")
 
             # --- LOOP 4: FOLLOW-UP SCHEDULES ---
@@ -1892,8 +1951,10 @@ def main():
                             "raw": str(f_row.get("sequence_no")),
                             "detail": f"Followup schedule matched {len(matched_f_ids)} database records by Patient + Prescription + Sequence. Skipping update."
                         })
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} follow-up plans...")
+            conn.commit()
             print(f"      Followups complete: {inserted_followups} new, {skipped_followups} skipped.")
 
     try:
@@ -1936,7 +1997,7 @@ def main():
 
     except Exception as exc:
         print(f"\n[ERROR] CRITICAL ERROR OCCURRED during Phase B Transactional Migration: {exc}")
-        print("Transactional changes (visits, prescriptions, items, follow-ups) have been rolled back.")
+        print("Transactional changes up to the last successful batch commit remain in the database.")
         print("Patient changes remain committed.")
         stats["migration_status"] = f"FAILED_PHASE_B: {type(exc).__name__}"
         migration_log.append({
