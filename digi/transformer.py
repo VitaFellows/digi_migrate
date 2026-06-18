@@ -89,7 +89,7 @@ def _row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
     # Fallback for merged/noisy headers where candidate text is a subset.
     for candidate in candidates:
         candidate_norm = _norm(candidate)
-        if not candidate_norm:
+        if not candidate_norm or len(candidate_norm) < 3:
             continue
         for key_norm, value in normalized.items():
             if candidate_norm in key_norm:
