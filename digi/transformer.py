@@ -89,7 +89,7 @@ def _row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
     # Fallback for merged/noisy headers where candidate text is a subset.
     for candidate in candidates:
         candidate_norm = _norm(candidate)
-        if not candidate_norm:
+        if not candidate_norm or len(candidate_norm) < 3:
             continue
         for key_norm, value in normalized.items():
             if candidate_norm in key_norm:
@@ -348,14 +348,21 @@ def transform_visit(row: dict, patient_uuid: str, doctor_uuid: str, visit_date: 
             chief_complaint = ", ".join(complaints_list) if complaints_list else "Not recorded"
             duration_val = primary_duration
         else:
+            complaint_candidates = ["CHIEF COMPLAIN HISTORY", "CHIEF COMPLAINT", "Chief Complaint", "Advice//Recommendation CHIEF COMPLAIN HISTORY"]
+            row_keys_norm = {_norm(k) for k in row.keys()}
+            
+            # If the row has any real complaint header, exclude "Unnamed: 28" from the lookup
+            has_real_header = any(_norm(cand) in row_keys_norm for cand in complaint_candidates) or \
+                              any("chiefcomplaint" in k_norm or "chiefcomplainhistory" in k_norm for k_norm in row_keys_norm)
+            
+            lookup_candidates = list(complaint_candidates)
+            if not has_real_header:
+                lookup_candidates.append("Unnamed: 28")
+
             chief_complaint = clean_text(
                 _row_lookup(
                     row,
-                    "CHIEF COMPLAIN HISTORY",
-                    "CHIEF COMPLAINT",
-                    "Chief Complaint",
-                    "Advice//Recommendation CHIEF COMPLAIN HISTORY",
-                    "Unnamed: 28",
+                    *lookup_candidates,
                 ),
                 max_len=2000,
             ) or "Not recorded"
