@@ -170,7 +170,19 @@ def my_row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
             if extra not in enhanced_candidates:
                 enhanced_candidates.append(extra)
 
-    res = original_row_lookup(row, *enhanced_candidates, default=default)
+    # Filter out short candidates (< 3 chars normalized) unless they are an exact normalized match in row keys.
+    # This avoids false positive substring matches in original_row_lookup fallback.
+    normalized_row_keys = {"".join(ch for ch in str(k).lower() if k is not None and ch.isalnum()) for k in row.keys()}
+    filtered_candidates = []
+    for c in enhanced_candidates:
+        c_norm = "".join(ch for ch in str(c).lower() if c is not None and ch.isalnum())
+        if len(c_norm) < 3:
+            if c_norm in normalized_row_keys:
+                filtered_candidates.append(c)
+        else:
+            filtered_candidates.append(c)
+
+    res = original_row_lookup(row, *filtered_candidates, default=default)
     
     # If UID lookup failed, check Unnamed: 0 or other unnamed columns
     if is_uid and (res is None or str(res).strip() == "" or pd.isna(res)):
@@ -1404,11 +1416,10 @@ def main():
         uid_column = _find_column(sheet_df, "UID", "ma ", "CONSULTATION ID", "CONSULTATION ID\n", "CONSULTATION ID\nDS1", "CONSULTATION ID\nDS5", "PATIENT ID", "Id", "ID", "Unnamed: 0")
         if uid_column is not None:
             uid_mask = sheet_df[uid_column].apply(lambda value: not pd.isna(value) and str(value).strip() != "")
-            dropped = int((~uid_mask).sum())
-            if dropped:
-                print(f"      Dropped {dropped} rows missing UID values in column '{uid_column}'.")
-                blank_uids_dropped += dropped
-            sheet_df = sheet_df.loc[uid_mask].copy()
+            missing_count = int((~uid_mask).sum())
+            if missing_count:
+                print(f"      Note: {missing_count} rows are missing UID values in column '{uid_column}'. These will be processed with generated tracking IDs and nullable legacy_id.")
+            # Do NOT filter/drop the rows; process them all.
         else:
             print(f"      [WARNING] Could not identify a UID/Consultation ID column for sheet '{sheet_name}'.")
             
@@ -1470,6 +1481,7 @@ def main():
             uid = resolve_uid(raw)
             if not uid:
                 uid = f"unassigned_{uuid.uuid4().hex[:8]}"
+                patient_row["legacy_id"] = None
             
             custom_gov_id = generate_custom_government_id(patient_row.get("full_name"), raw_age, raw_date, uid)
             patient_row["government_id"] = custom_gov_id
@@ -1696,6 +1708,8 @@ def main():
                     center_id=item["resolved_center_id"], 
                     created_by_user_id=item["created_by_user_id"]
                 )
+                if not resolve_uid(raw):
+                    visit_row["legacy_id"] = None
                 
                 # Validate NOT NULL fields
                 _validate_not_null_fields(
@@ -1790,6 +1804,8 @@ def main():
                     raw.get("DATE", raw.get("Date")), 
                     migration_log
                 )
+                if not resolve_uid(raw):
+                    rx_row["legacy_id"] = None
                 
                 _validate_not_null_fields(
                     "prescription",
