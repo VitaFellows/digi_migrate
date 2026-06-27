@@ -398,7 +398,7 @@ def _row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
     # Fallback for merged/noisy headers where candidate text is a subset.
     for candidate in candidates:
         candidate_norm = _normalise_key(candidate)
-        if not candidate_norm:
+        if not candidate_norm or len(candidate_norm) < 3:
             continue
         for key_norm, value in normalized.items():
             if candidate_norm in key_norm:
@@ -474,13 +474,26 @@ def detect_duplicates(df: pd.DataFrame, log: list) -> pd.DataFrame:
     filtered = df.copy()
 
     if uid_col is not None:
+        phone_col = columns.get("contactno.") or columns.get("contactno") or columns.get("phone") or columns.get("mobile")
         seen: dict[Any, int] = {}
         keep_mask = []
-        for idx, value in enumerate(filtered[uid_col].tolist()):
-            if _is_blank(value):
+        for idx, row in filtered.iterrows():
+            value = row.get(uid_col)
+            if _is_blank(value) or str(value).strip().lower() in ("date", "#ref!", "uid", "id", "unnamed", "consultation id", "patient id"):
                 keep_mask.append(True)
                 continue
-            key = str(value).strip()
+            
+            if isinstance(value, float) and value.is_integer():
+                uid_str = str(int(value))
+            elif isinstance(value, int):
+                uid_str = str(value)
+            else:
+                uid_str = str(value).strip()
+                
+            pat_name = clean_text(row.get(patient_col)) if patient_col else ""
+            phone_val = str(row.get(phone_col)).strip() if phone_col and not pd.isna(row.get(phone_col)) else ""
+            key = (uid_str, pat_name.lower(), phone_val)
+            
             if key in seen:
                 _log(log, str(value), "UID", "DUPLICATE_UID", value, f"Duplicate of row {seen[key] + 1}")
                 keep_mask.append(False)
