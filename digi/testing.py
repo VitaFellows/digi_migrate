@@ -170,7 +170,25 @@ def my_row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
             if extra not in enhanced_candidates:
                 enhanced_candidates.append(extra)
 
-    res = original_row_lookup(row, *enhanced_candidates, default=default)
+    is_address = any("ADDRESS" in str(c).upper() for c in candidates)
+    if is_address:
+        for extra in ("Address", "ADDRESS", "City/Village", "Village / City", "Village/City", "City / Village", "Village", "village", "city/village", "village / city"):
+            if extra not in enhanced_candidates:
+                enhanced_candidates.append(extra)
+
+    # Filter out short candidates (< 3 chars normalized) unless they are an exact normalized match in row keys.
+    # This avoids false positive substring matches in original_row_lookup fallback.
+    normalized_row_keys = {"".join(ch for ch in str(k).lower() if k is not None and ch.isalnum()) for k in row.keys()}
+    filtered_candidates = []
+    for c in enhanced_candidates:
+        c_norm = "".join(ch for ch in str(c).lower() if c is not None and ch.isalnum())
+        if len(c_norm) < 3:
+            if c_norm in normalized_row_keys:
+                filtered_candidates.append(c)
+        else:
+            filtered_candidates.append(c)
+
+    res = original_row_lookup(row, *filtered_candidates, default=default)
     
     # If UID lookup failed, check Unnamed: 0 or other unnamed columns
     if is_uid and (res is None or str(res).strip() == "" or pd.isna(res)):
@@ -186,8 +204,19 @@ def my_row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
     return res
 
 def resolve_uid(row: dict) -> str:
-    uid = my_row_lookup(row, "UID", "Id", "ID")
-    return str(uid).strip() if uid and not pd.isna(uid) else ""
+    uid = my_row_lookup(row, "UID", "Id", "ID", "CONSULTATION ID", "Consultation ID", "ma ")
+    if uid and not pd.isna(uid):
+        if isinstance(uid, float) and uid.is_integer():
+            uid_str = str(int(uid))
+        elif isinstance(uid, int):
+            uid_str = str(uid)
+        else:
+            uid_str = str(uid).strip()
+            
+        if uid_str.lower() in ("date", "#ref!", "uid", "id", "unnamed"):
+            return ""
+        return uid_str
+    return ""
 
 # Enhanced Dynamic Medicine Columns support
 def my_infer_block_start_indices(keys: list[str]) -> list[int]:
@@ -225,11 +254,44 @@ def parse_multiline_medicines(cell_value: str) -> list[dict]:
         duration = None
         notes = None
         
+        # Try to parse dosage pattern like 1-0-1 or 0-1-0 or 1-1-1
+        dosage_match = re.search(r"\b(\d+-\d+-\d+)\b", med_name)
+        if dosage_match:
+            dosage = dosage_match.group(1)
+            med_name = med_name.replace(dosage_match.group(0), "")
+            
+        # Try to parse duration like "for 5 days", "5 days", "5day", "for 5 day"
+        duration_match = re.search(r"\b(?:for\s+)?(\d+\s*days?)\b", med_name, re.IGNORECASE)
+        if duration_match:
+            duration = duration_match.group(1)
+            med_name = med_name.replace(duration_match.group(0), "")
+            # Remove any dangling "for" before/after
+            med_name = re.sub(r"\bfor\s*$", "", med_name, flags=re.IGNORECASE)
+        else:
+            # Maybe just numbers + days? e.g. "5 days"
+            duration_match = re.search(r"\b(\d+\s*days?)\b", med_name, re.IGNORECASE)
+            if duration_match:
+                duration = duration_match.group(1)
+                med_name = med_name.replace(duration_match.group(0), "")
+                med_name = re.sub(r"\bfor\s*$", "", med_name, flags=re.IGNORECASE)
+
+        med_name = re.sub(r"\s+", " ", med_name).strip(" ,.-_+")
+        
         if len(parts) > 1:
             if re.match(r"^[✓✗\s—\-+_|:;.,]+$", parts[1]):
                 pass
             else:
                 notes = parts[1]
+                # If dosage not found in medicine name, try notes
+                if dosage == "1":
+                    d_m = re.search(r"\b(\d+-\d+-\d+)\b", notes)
+                    if d_m:
+                        dosage = d_m.group(1)
+                # If duration not found in medicine name, try notes
+                if duration is None:
+                    dur_m = re.search(r"\b(?:for\s+)?(\d+\s*days?)\b", notes, re.IGNORECASE)
+                    if dur_m:
+                        duration = dur_m.group(1)
                 freq_match = re.search(r"\b(od|bd|tds|tid|qid|sos|hs|prn|once|twice|daily|weekly)\b", notes.lower())
                 if freq_match:
                     frequency = freq_match.group(1).upper()
@@ -246,6 +308,7 @@ def parse_multiline_medicines(cell_value: str) -> list[dict]:
             "notes": notes,
         })
     return parsed_items
+
 
 from transformer import build_frequency_string, clean_medicine_name, _blank_row, _extract_block_value
 
@@ -315,7 +378,7 @@ def my_transform_prescription_items(row: dict, prescription_uuid: str, log: list
                     items.append(item)
                 continue
 
-            dosage = clean_text(_extract_block_value(keys, values, start_index, 1)) or "1"
+            quantity_val = clean_text(_extract_block_value(keys, values, start_index, 1))
             unit = clean_text(_extract_block_value(keys, values, start_index, 2))
             morning = _extract_block_value(keys, values, start_index, 3)
             afternoon = _extract_block_value(keys, values, start_index, 4)
@@ -325,6 +388,30 @@ def my_transform_prescription_items(row: dict, prescription_uuid: str, log: list
             frequency = build_frequency_string(morning, afternoon, evening, remark) or "As directed"
             notes = clean_text(remark, max_len=1000)
             
+            # Format dosage like 1-0-1 if morning/afternoon/evening are present and not all zero
+            def format_mae_val(v: Any) -> str:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return "0"
+                v_str = str(v).strip()
+                if v_str in ("", "nan", "none", "-", "0"):
+                    return "0"
+                try:
+                    f_val = float(v_str)
+                    if f_val.is_integer():
+                        return str(int(f_val))
+                    return str(f_val)
+                except ValueError:
+                    return v_str
+            
+            m_str = format_mae_val(morning)
+            a_str = format_mae_val(afternoon)
+            e_str = format_mae_val(evening)
+            
+            if not (m_str == "0" and a_str == "0" and e_str == "0"):
+                dosage = f"{m_str}-{a_str}-{e_str}"
+            else:
+                dosage = quantity_val or "1"
+            
             item = _blank_row("prescriptionitem")
             item.update({
                 "id": str(uuid.uuid4()),
@@ -333,7 +420,7 @@ def my_transform_prescription_items(row: dict, prescription_uuid: str, log: list
                 "dosage": dosage,
                 "frequency": frequency,
                 "duration": duration,
-                "quantity": None,
+                "quantity": quantity_val,
                 "unit": unit,
                 "notes": notes,
                 "formulary_id": None,
@@ -443,6 +530,12 @@ def _read_config() -> DbConfig:
                 encoded_password = urllib.parse.quote(password)
                 database_url = f"{prefix}://{user}:{encoded_password}@{host_part}"
 
+    # Auto-route to port 6543 (PgBouncer connection pooler) for stability if direct port 5432 is used
+    if ":5432/" in database_url:
+        database_url = database_url.replace(":5432/", ":6543/")
+
+
+
     env_excel_path = os.getenv("INPUT_EXCEL_PATH")
     env_workbook_path = os.getenv("MIGRATION_WORKBOOK_PATH")
     
@@ -548,7 +641,7 @@ def _center_aliases(value: Any) -> list[str]:
     lowered = lowered.replace("center", " ")
     lowered = lowered.replace("digiswasthya", " ")
     lowered = lowered.replace("vijay nagar", "vijaynagar")
-    parts = [part.strip() for part in re.split(r"[,/\-]", lowered) if part.strip()]
+    parts = [part.strip() for part in re.split(r"[,/\-\s]", lowered) if part.strip()]
     aliases = set()
     for part in parts:
         cleaned = _norm_text(part)
@@ -561,16 +654,51 @@ def _center_aliases(value: Any) -> list[str]:
 
 
 def _resolve_center_row_for_sheet(center_rows: list[dict[str, Any]], sheet_ref: int | str | None) -> dict[str, Any] | None:
-    if not center_rows:
-        return None
     if isinstance(sheet_ref, str):
+        ref_lower = sheet_ref.strip().lower()
+        
+        explicit_id_mappings = {
+            "bhawadi": {"id": "e73c2c5f-6aea-4cfd-af7b-95acf4778f70", "name": "DigiSwasthya Telemedicine Centre, DS3 Bhawadi", "center_code": "DS3-Bhawadi"},
+            "uk": {"id": "56137eeb-4720-4288-8ab2-1e2f71e096f3", "name": "DigiSwasthya Telemedicine Centre, DS6-UK", "center_code": "DS6-UK"},
+            "ep": {"id": "28b98bcc-962f-47a9-9c36-a38f1a27b478", "name": "DigiSwasthya Telemedicine Centre, EP", "center_code": "EP"},
+            "gujarat": {"id": "046f1796-84f8-4a3e-9b5a-d582079adca0", "name": "DigiSwasthya Telemedicine Centre, Gujarat", "center_code": "Gujarat"},
+            "gujrat": {"id": "046f1796-84f8-4a3e-9b5a-d582079adca0", "name": "DigiSwasthya Telemedicine Centre, Gujarat", "center_code": "Gujarat"},
+            "nalasopara": {"id": "2b57b31e-ddb6-4cb5-8b4a-1d7bdbee8955", "name": "DigiSwasthya Telemedicine Centre, Nalasopara", "center_code": "Nalasopara"},
+            "sonbhadr": {"id": "b7d2b48d-2b46-4868-adb0-6dac1ef6c75a", "name": "DigiSwasthya Telemedicine Centre, Sonbhadra", "center_code": "Sonbhadra"},
+            "sonbhadra": {"id": "b7d2b48d-2b46-4868-adb0-6dac1ef6c75a", "name": "DigiSwasthya Telemedicine Centre, Sonbhadra", "center_code": "Sonbhadra"},
+        }
+        for key, info in explicit_id_mappings.items():
+            if key in ref_lower:
+                for row in (center_rows or []):
+                    if str(row.get("id", "")).strip().lower() == info["id"].lower():
+                        return row
+                return info
+
+        explicit_mappings = {
+            "gorewada": "DS-TMC-005",
+            "jagnath budhwari": "DS-TMC-006",
+            "igr": "DS-TMC-007",
+            "chinchbhavan": "DS-TMC-008",
+            "narsala": "DS-TMC-009",
+            "hasanbagh": "DS-TMC-010",
+            "chakole": "DS-TMC-011",
+            "bharatwada": "DS-TMC-012",
+            "peth": "DS-TMC-013",
+            "rajgurunagar": "DS-TMC-014",
+            "karanjawane": "DS-TMC-015",
+            "itaunja": "DS-TMC-004",
+            "kathaicha": "DS-TMC-001",
+            "bihar": "DS-TMC-002",
+            "ashrafpur": "DS-TMC-003",
+            "asharafpur": "DS-TMC-003"
+        }
+        for key, target_code in explicit_mappings.items():
+            if key in ref_lower:
+                for row in (center_rows or []):
+                    if str(row.get("center_code", "")).strip().upper() == target_code.upper():
+                        return row
+
         stripped = sheet_ref.strip()
-        # Special fallback mapping for Bihar sheet
-        if stripped.lower() == "bihar":
-            for row in center_rows:
-                name = str(row.get("name", "")).lower()
-                if "sahebganj" in name:
-                    return row
         if stripped.isdigit():
             index = int(stripped)
             if 0 <= index < len(center_rows):
@@ -581,18 +709,18 @@ def _resolve_center_row_for_sheet(center_rows: list[dict[str, Any]], sheet_ref: 
             row_aliases = _center_aliases(row.get("short_name")) + _center_aliases(row.get("name")) + _center_aliases(row.get("center_code"))
             row_aliases = [alias for alias in dict.fromkeys(row_aliases) if alias]
             for alias in row_aliases:
-                if alias == normalized or alias in sheet_aliases or normalized in alias:
+                if alias == normalized or alias in sheet_aliases or normalized in alias or alias in normalized:
                     return row
             for alias in row_aliases:
                 for sheet_alias in sheet_aliases:
                     ratio = SequenceMatcher(None, alias, sheet_alias).ratio()
                     if ratio >= 0.88:
                         return row
+        return None
     elif isinstance(sheet_ref, int):
         if 0 <= sheet_ref < len(center_rows):
             return center_rows[sheet_ref]
-        return center_rows[0]
-    return center_rows[0]
+    return None
 
 
 def _build_center_coordinator_rotation(user_rows: list[dict[str, Any]]) -> tuple[dict[str, list[str]], dict[str, int]]:
@@ -866,6 +994,9 @@ def clean_doctor_name(val: Any) -> str:
         "abhijitgupta": "abhijeetgupta",
         "shivangi": "shivangiyadav",
         "bhuvneshchaturvedicentre": "bhuvneshchaturvedi",
+        "bhuvneshchaturvedicamp": "bhuvneshchaturvedi",
+        "ravilandgecentre": "raviashoklandge",
+        "anmol": "anmolji",
     }
     return corrections.get(cleaned, cleaned)
 
@@ -898,7 +1029,12 @@ def _has_actual_updates(conn, schema: str, table: str, record_id: str, transform
             return False
             
         for col, excel_val in transformed_row.items():
-            if col in ("id", "created_at", "migrated_at", "legacy_id", "legacy_source", "tenant_id", "is_demo"):
+            if col in ("id", "created_at", "migrated_at", "legacy_source", "tenant_id", "is_demo"):
+                continue
+            if col == "legacy_id":
+                if db_row.get("legacy_id") is None or str(db_row.get("legacy_id")).strip() == "":
+                    if excel_val and str(excel_val).strip() != "":
+                        return True
                 continue
                 
             db_val = db_row.get(col)
@@ -970,7 +1106,13 @@ def _update_record_fields(conn, schema: str, table: str, record_id: str, transfo
         has_actual_field_updates = False
 
         for col, excel_val in transformed_row.items():
-            if col in ("id", "created_at", "migrated_at", "legacy_id", "legacy_source", "tenant_id", "is_demo"):
+            if col in ("id", "created_at", "migrated_at", "legacy_source", "tenant_id", "is_demo"):
+                continue
+            if col == "legacy_id":
+                if db_row.get("legacy_id") is None or str(db_row.get("legacy_id")).strip() == "":
+                    if excel_val and str(excel_val).strip() != "":
+                        update_fields["legacy_id"] = str(excel_val).strip()
+                        has_actual_field_updates = True
                 continue
                 
             db_val = db_row.get(col)
@@ -1213,8 +1355,12 @@ def main():
     # collision_start, collision_end = _get_collision_range(COLLISION_START_DATE_STR, COLLISION_END_DATE_STR)
     print("Running in full update/skip testing mode: all rows are processed for update checks regardless of date.")
 
-    print(f"Connecting to database at {cfg.database_url.split('@')[-1]}...")
-    engine = create_engine(cfg.database_url, pool_pre_ping=True)
+    engine = create_engine(
+        cfg.database_url,
+        pool_pre_ping=True,
+    )
+
+
 
     stats = {
         "migration_status": "STARTED",
@@ -1251,10 +1397,22 @@ def main():
 
     # Pre-flight metadata fetch
     try:
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             print("\n[1/5] Fetching live metadata from Supabase database...")
             
             # Centers
+            centers_to_ensure = [
+                {"id": "e73c2c5f-6aea-4cfd-af7b-95acf4778f70", "name": "DigiSwasthya Telemedicine Centre, DS3 Bhawadi", "center_code": "DS3-Bhawadi", "is_active": True},
+                {"id": "56137eeb-4720-4288-8ab2-1e2f71e096f3", "name": "DigiSwasthya Telemedicine Centre, DS6-UK", "center_code": "DS6-UK", "is_active": True},
+                {"id": "28b98bcc-962f-47a9-9c36-a38f1a27b478", "name": "DigiSwasthya Telemedicine Centre, EP", "center_code": "EP", "is_active": True},
+                {"id": "046f1796-84f8-4a3e-9b5a-d582079adca0", "name": "DigiSwasthya Telemedicine Centre, Gujarat", "center_code": "Gujarat", "is_active": True},
+                {"id": "2b57b31e-ddb6-4cb5-8b4a-1d7bdbee8955", "name": "DigiSwasthya Telemedicine Centre, Nalasopara", "center_code": "Nalasopara", "is_active": True},
+                {"id": "b7d2b48d-2b46-4868-adb0-6dac1ef6c75a", "name": "DigiSwasthya Telemedicine Centre, Sonbhadra", "center_code": "Sonbhadra", "is_active": True},
+            ]
+            for c_info in centers_to_ensure:
+                conn.execute(text(f"INSERT INTO {_table(cfg.schema, 'center')} (id, name, center_code, is_active) VALUES (:id, :name, :center_code, :is_active) ON CONFLICT (id) DO NOTHING"), c_info)
+            conn.commit()
+
             center_sql = f"SELECT id, name, center_code, district, state FROM {_table(cfg.schema, 'center')}"
             db_centers = [dict(r) for r in conn.execute(text(center_sql)).mappings().all()]
             print(f"      Loaded {len(db_centers)} clinic centers from Supabase center table.")
@@ -1291,16 +1449,20 @@ def main():
 
             coordinators_by_center, coordinator_counters = _build_center_coordinator_rotation(db_users)
             
-            # Query database column metadata dynamically
+            # Query database column metadata dynamically using pg_attribute for extreme speed and PgBouncer compatibility
             for table_name in ("patient", "visit", "prescription", "prescriptionitem", "followup_schedule"):
                 col_sql = """
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_schema = :schema AND table_name = :table
+                    SELECT attname 
+                    FROM pg_attribute 
+                    WHERE attrelid = CAST(:table_name AS regclass)
+                      AND attnum > 0 
+                      AND NOT attisdropped
                 """
-                col_res = conn.execute(text(col_sql), {"schema": cfg.schema, "table": table_name})
+                full_table = f"{cfg.schema}.{table_name}"
+                col_res = conn.execute(text(col_sql), {"table_name": full_table})
                 DB_TABLE_COLUMNS[table_name] = {r[0] for r in col_res.all()}
             print("      Loaded database table columns dynamically for schema safety.")
+
     except Exception as exc:
         print(f"\n[ERROR] CRITICAL ERROR OCCURRED during metadata fetch: {exc}")
         sys.exit(1)
@@ -1330,6 +1492,8 @@ def main():
     excel_duplicates_dropped = 0
     date_filtered_rows_dropped = 0
     
+    missing_uid_counter = 45660  # Start sequential counter for rows missing UID
+    
     for sheet_name in sheets_to_process:
         print(f"\n   --- Processing sheet: '{sheet_name}' ---")
         if hasattr(excel_source, "seek"):
@@ -1346,18 +1510,20 @@ def main():
             
         # Resolve center ID for this sheet
         resolved_center = _resolve_center_row_for_sheet(db_centers, sheet_name)
-        resolved_center_id = str(resolved_center.get("id")) if resolved_center else db_centers[0]["id"]
+        if not resolved_center:
+            print(f"      [SKIP] Sheet '{sheet_name}' does not map to any database center. Skipping this sheet.")
+            continue
+        resolved_center_id = str(resolved_center.get("id"))
         print(f"      Mapped sheet '{sheet_name}' -> Center: '{resolved_center.get('name')}' ({resolved_center_id})")
         
         # Resolve UID column name dynamically
         uid_column = _find_column(sheet_df, "UID", "ma ", "CONSULTATION ID", "CONSULTATION ID\n", "CONSULTATION ID\nDS1", "CONSULTATION ID\nDS5", "PATIENT ID", "Id", "ID", "Unnamed: 0")
         if uid_column is not None:
             uid_mask = sheet_df[uid_column].apply(lambda value: not pd.isna(value) and str(value).strip() != "")
-            dropped = int((~uid_mask).sum())
-            if dropped:
-                print(f"      Dropped {dropped} rows missing UID values in column '{uid_column}'.")
-                blank_uids_dropped += dropped
-            sheet_df = sheet_df.loc[uid_mask].copy()
+            missing_count = int((~uid_mask).sum())
+            if missing_count:
+                print(f"      Note: {missing_count} rows are missing UID values in column '{uid_column}'. These will be processed with generated tracking IDs and nullable legacy_id.")
+            # Do NOT filter/drop the rows; process them all.
         else:
             print(f"      [WARNING] Could not identify a UID/Consultation ID column for sheet '{sheet_name}'.")
             
@@ -1392,18 +1558,27 @@ def main():
                 doctor_name_col = _find_column(sheet_df, "DOCTOR'S NAME", "DOCTOR NAME", "Doctor Name")
                 if doctor_name_col:
                     excel_doc_name = raw.get(doctor_name_col)
+                    if (excel_doc_name is None or pd.isna(excel_doc_name) or str(excel_doc_name).strip() == "") and sheet_name.strip().lower() == "bihar":
+                        sheet_cols = list(sheet_df.columns)
+                        doc_name_idx = -1
+                        for idx_c, col in enumerate(sheet_cols):
+                            if str(col).strip().upper() == "DOCTOR'S NAME":
+                                doc_name_idx = idx_c
+                                break
+                        if doc_name_idx != -1 and doc_name_idx + 1 < len(sheet_cols):
+                            right_col = sheet_cols[doc_name_idx + 1]
+                            if "gender" in str(right_col).lower():
+                                excel_doc_name = raw.get(right_col)
+                    
                     clean_excel_name = clean_doctor_name(excel_doc_name)
                     if clean_excel_name:
                         doctor_row = user_index_by_clean_name.get(clean_excel_name)
             
             doctor_uuid = str(doctor_row.get("id")) if doctor_row else None
+            if not doctor_uuid:
+                doctor_uuid = FALLBACK_DOCTOR_USER_ID
             
             prescription_doctor_uuid = doctor_uuid
-            if not prescription_doctor_uuid:
-                if db_doctors:
-                    prescription_doctor_uuid = db_doctors[0]["id"]
-                else:
-                    prescription_doctor_uuid = db_users[0]["id"]
                     
             created_by_user_id = _pick_center_coordinator(resolved_center_id, coordinators_by_center, coordinator_counters, db_users[0]["id"], all_coordinators)
             
@@ -1418,7 +1593,9 @@ def main():
             raw_date = _row_lookup(raw, "DATE", "Date")
             uid = resolve_uid(raw)
             if not uid:
-                uid = f"unassigned_{uuid.uuid4().hex[:8]}"
+                uid = str(missing_uid_counter)
+                missing_uid_counter += 1
+            patient_row["legacy_id"] = uid
             
             custom_gov_id = generate_custom_government_id(patient_row.get("full_name"), raw_age, raw_date, uid)
             patient_row["government_id"] = custom_gov_id
@@ -1453,76 +1630,83 @@ def main():
 
     def process_patient_batch(batch, start_idx):
         nonlocal inserted_patients, updated_patients_count
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             for idx, item in enumerate(batch, start=start_idx):
-                uid = item["uid"]
-                patient_row = item["patient_row"]
-                
-                # Check for duplicates in Supabase database
-                matched_ids = _find_all_matching_patient_ids(conn, cfg.schema, patient_row)
-                
-                if matched_ids:
-                    # 1. Check if any matched record has any actual field updates
-                    any_row_has_updates = any(
-                        _has_actual_updates(conn, cfg.schema, "patient", pid, patient_row)
-                        for pid in matched_ids
-                    )
+                try:
+                    uid = item["uid"]
+                    patient_row = item["patient_row"]
                     
-                    # 2. Update all matched duplicate database records
-                    for pid in matched_ids:
-                        _update_record_fields(
-                            conn, 
-                            cfg.schema, 
-                            "patient", 
-                            pid, 
-                            patient_row, 
-                            uid, 
-                            migration_log,
-                            force_legacy_source=any_row_has_updates
+                    # Check for duplicates in Supabase database
+                    matched_ids = _find_all_matching_patient_ids(conn, cfg.schema, patient_row)
+                    
+                    if matched_ids:
+                        # 1. Check if any matched record has any actual field updates
+                        any_row_has_updates = any(
+                            _has_actual_updates(conn, cfg.schema, "patient", pid, patient_row)
+                            for pid in matched_ids
                         )
                         
-                    # Map to the first matched patient ID for downstream tables
-                    resolved_id = matched_ids[0]
-                    patient_id_map[patient_row["id"]] = resolved_id
-                    item["resolved_patient_ids"] = matched_ids
-                    updated_patients_count += len(matched_ids)
-                    stats["existing_patients_reused"] += 1
-                    
-                    migration_log.append({
-                        "uid": uid,
-                        "field": "patient",
-                        "issue": "SKIPPED_PATIENT_DUPLICATE",
-                        "raw": patient_row.get("full_name"),
-                        "detail": f"Patient matched {len(matched_ids)} database records by Name + Phone. Updated all. Reused ID: {resolved_id}"
-                    })
-                else:
-                    # 2. Insert new patient record if not found
-                    if not patient_row.get("id"):
-                        patient_row["id"] = str(uuid.uuid4())
+                        # 2. Update all matched duplicate database records
+                        for pid in matched_ids:
+                            _update_record_fields(
+                                conn, 
+                                cfg.schema, 
+                                "patient", 
+                                pid, 
+                                patient_row, 
+                                uid, 
+                                migration_log,
+                                force_legacy_source=any_row_has_updates
+                            )
+                            
+                        # Map to the first matched patient ID for downstream tables
+                        resolved_id = matched_ids[0]
+                        patient_id_map[patient_row["id"]] = resolved_id
+                        item["resolved_patient_ids"] = matched_ids
+                        updated_patients_count += len(matched_ids)
+                        stats["existing_patients_reused"] += 1
                         
-                    columns = list(patient_row.keys())
-                    placeholders = ", ".join(f":{col}" for col in columns)
-                    column_sql = ", ".join(f'"{col}"' for col in columns)
-                    sql = f"INSERT INTO {_table(cfg.schema, 'patient')} ({column_sql}) VALUES ({placeholders}) RETURNING id"
-                    
-                    result = conn.execute(text(sql), patient_row).mappings().first()
-                    inserted_id = str(result["id"])
-                    
-                    patient_id_map[patient_row["id"]] = inserted_id
-                    item["resolved_patient_ids"] = [inserted_id]
-                    inserted_patients += 1
-                    stats["new_patients_inserted"] += 1
-                    
-                    migration_log.append({
-                        "uid": uid,
-                        "field": "patient",
-                        "issue": "INSERTED_PATIENT_NEW",
-                        "raw": patient_row.get("full_name"),
-                        "detail": f"Patient '{patient_row.get('full_name')}' not found in database. Registered new patient with ID: {inserted_id}"
-                    })
-                    
-                if idx % 100 == 0 or idx == len(excel_row_data):
-                    print(f"      Processed {idx}/{len(excel_row_data)} patients...")
+                        migration_log.append({
+                            "uid": uid,
+                            "field": "patient",
+                            "issue": "SKIPPED_PATIENT_DUPLICATE",
+                            "raw": patient_row.get("full_name"),
+                            "detail": f"Patient matched {len(matched_ids)} database records by Name + Phone. Updated all. Reused ID: {resolved_id}"
+                        })
+                    else:
+                        # 2. Insert new patient record if not found
+                        if not patient_row.get("id"):
+                            patient_row["id"] = str(uuid.uuid4())
+                            
+                        columns = list(patient_row.keys())
+                        placeholders = ", ".join(f":{col}" for col in columns)
+                        column_sql = ", ".join(f'"{col}"' for col in columns)
+                        sql = f"INSERT INTO {_table(cfg.schema, 'patient')} ({column_sql}) VALUES ({placeholders}) RETURNING id"
+                        
+                        result = conn.execute(text(sql), patient_row).mappings().first()
+                        inserted_id = str(result["id"])
+                        
+                        patient_id_map[patient_row["id"]] = inserted_id
+                        item["resolved_patient_ids"] = [inserted_id]
+                        inserted_patients += 1
+                        stats["new_patients_inserted"] += 1
+                        
+                        migration_log.append({
+                            "uid": uid,
+                            "field": "patient",
+                            "issue": "INSERTED_PATIENT_NEW",
+                            "raw": patient_row.get("full_name"),
+                            "detail": f"Patient '{patient_row.get('full_name')}' not found in database. Registered new patient with ID: {inserted_id}"
+                        })
+                        
+                    if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                        conn.commit()
+                        print(f"      Processed {idx}/{len(excel_row_data)} patients...")
+                except Exception as row_exc:
+                    conn.rollback()
+                    print(f"[ERROR] Error processing patient {idx} ({patient_row.get('full_name') if 'patient_row' in locals() else 'Unknown'}): {row_exc}")
+                    raise row_exc
+            conn.commit()
 
     try:
         # Process first 5 records
@@ -1562,7 +1746,7 @@ def main():
 
     except Exception as exc:
         print(f"\n[ERROR] CRITICAL ERROR OCCURRED during Patient Migration: {exc}")
-        print("Patient transaction has been rolled back. No changes were committed.")
+        print("Patient changes up to the last successful batch commit remain in the database.")
         stats["migration_status"] = f"FAILED_PHASE_A: {type(exc).__name__}"
         migration_log.append({
             "uid": "SYSTEM",
@@ -1621,7 +1805,7 @@ def main():
 
     def process_phase_b_batch(batch, start_idx):
         nonlocal inserted_visits, skipped_visits, inserted_rx, skipped_rx, inserted_items, skipped_items, inserted_followups, skipped_followups
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             # --- LOOP 1: VISITS ---
             print(f"\nMigrating 'visit' table for batch starting at index {start_idx}...")
             for offset, item in enumerate(batch):
@@ -1645,6 +1829,8 @@ def main():
                     center_id=item["resolved_center_id"], 
                     created_by_user_id=item["created_by_user_id"]
                 )
+                if not resolve_uid(raw):
+                    visit_row["legacy_id"] = item["uid"]
                 
                 # Validate NOT NULL fields
                 _validate_not_null_fields(
@@ -1708,8 +1894,10 @@ def main():
                     inserted_visits += 1
                     stats["visits_inserted"] += 1
                     
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} visits...")
+            conn.commit()
             print(f"      Visits complete: {inserted_visits} new, {skipped_visits} skipped.")
             
             # --- LOOP 2: PRESCRIPTIONS ---
@@ -1732,6 +1920,8 @@ def main():
                     raw.get("DATE", raw.get("Date")), 
                     migration_log
                 )
+                if not resolve_uid(raw):
+                    rx_row["legacy_id"] = item["uid"]
                 
                 _validate_not_null_fields(
                     "prescription",
@@ -1777,8 +1967,10 @@ def main():
                     inserted_rx += 1
                     stats["prescriptions_inserted"] += 1
                     
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} prescriptions...")
+            conn.commit()
             print(f"      Prescriptions complete: {inserted_rx} new, {skipped_rx} skipped.")
 
             # --- LOOP 3: PRESCRIPTION ITEMS ---
@@ -1794,7 +1986,7 @@ def main():
                     continue
                 supabase_rx_id = item["supabase_prescription_id"]
                 
-                items_list = transform_prescription_items(raw, supabase_rx_id, migration_log)
+                items_list = my_transform_prescription_items(raw, supabase_rx_id, migration_log)
                 for item_row in items_list:
                     item_row = clean_row_for_db(item_row)
                     
@@ -1832,8 +2024,10 @@ def main():
                             "detail": f"Item '{item_row.get('medication_name')}' matched {len(matched_item_ids)} database records by Prescription + Name + Details. Skipping update."
                         })
                         
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} medication lists...")
+            conn.commit()
             print(f"      Medication Items complete: {inserted_items} new, {skipped_items} skipped.")
 
             # --- LOOP 4: FOLLOW-UP SCHEDULES ---
@@ -1892,8 +2086,10 @@ def main():
                             "raw": str(f_row.get("sequence_no")),
                             "detail": f"Followup schedule matched {len(matched_f_ids)} database records by Patient + Prescription + Sequence. Skipping update."
                         })
-                if idx % 100 == 0 or idx == start_idx + len(batch) - 1:
+                if idx % 20 == 0 or idx == start_idx + len(batch) - 1:
+                    conn.commit()
                     print(f"      Processed {idx}/{len(excel_row_data)} follow-up plans...")
+            conn.commit()
             print(f"      Followups complete: {inserted_followups} new, {skipped_followups} skipped.")
 
     try:
@@ -1936,7 +2132,7 @@ def main():
 
     except Exception as exc:
         print(f"\n[ERROR] CRITICAL ERROR OCCURRED during Phase B Transactional Migration: {exc}")
-        print("Transactional changes (visits, prescriptions, items, follow-ups) have been rolled back.")
+        print("Transactional changes up to the last successful batch commit remain in the database.")
         print("Patient changes remain committed.")
         stats["migration_status"] = f"FAILED_PHASE_B: {type(exc).__name__}"
         migration_log.append({
