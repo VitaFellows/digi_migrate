@@ -89,7 +89,7 @@ def _row_lookup(row: dict, *candidates: str, default: Any = None) -> Any:
     # Fallback for merged/noisy headers where candidate text is a subset.
     for candidate in candidates:
         candidate_norm = _norm(candidate)
-        if not candidate_norm:
+        if not candidate_norm or len(candidate_norm) < 3:
             continue
         for key_norm, value in normalized.items():
             if candidate_norm in key_norm:
@@ -348,14 +348,21 @@ def transform_visit(row: dict, patient_uuid: str, doctor_uuid: str, visit_date: 
             chief_complaint = ", ".join(complaints_list) if complaints_list else "Not recorded"
             duration_val = primary_duration
         else:
+            complaint_candidates = ["CHIEF COMPLAIN HISTORY", "CHIEF COMPLAINT", "Chief Complaint", "Advice//Recommendation CHIEF COMPLAIN HISTORY"]
+            row_keys_norm = {_norm(k) for k in row.keys()}
+            
+            # If the row has any real complaint header, exclude "Unnamed: 28" from the lookup
+            has_real_header = any(_norm(cand) in row_keys_norm for cand in complaint_candidates) or \
+                              any("chiefcomplaint" in k_norm or "chiefcomplainhistory" in k_norm for k_norm in row_keys_norm)
+            
+            lookup_candidates = list(complaint_candidates)
+            if not has_real_header:
+                lookup_candidates.append("Unnamed: 28")
+
             chief_complaint = clean_text(
                 _row_lookup(
                     row,
-                    "CHIEF COMPLAIN HISTORY",
-                    "CHIEF COMPLAINT",
-                    "Chief Complaint",
-                    "Advice//Recommendation CHIEF COMPLAIN HISTORY",
-                    "Unnamed: 28",
+                    *lookup_candidates,
                 ),
                 max_len=2000,
             ) or "Not recorded"
@@ -394,16 +401,28 @@ def transform_visit(row: dict, patient_uuid: str, doctor_uuid: str, visit_date: 
                     if "unnamed" in str(next_key).lower():
                         duration_val = clean_text(row.get(next_key))
 
+        excel_status = clean_text(_row_lookup(row, "STATUS", "Status", "TREATMENT STATUS", "Treatment Status"))
+        visit_status = "COMPLETED"
+        history_notes_val = None
+        if excel_status:
+            history_notes_val = f"Treatment Status: {excel_status}"
+            if "going on" in excel_status.lower() or "in progress" in excel_status.lower():
+                visit_status = "IN_PROGRESS"
+            elif "cancelled" in excel_status.lower():
+                visit_status = "CANCELLED"
+            elif "waiting" in excel_status.lower():
+                visit_status = "WAITING"
+
         visit.update({
             "id": str(uuid.uuid4()),
             "patient_id": patient_uuid,
             "center_id": center_id or CENTER_ID,
             "created_by_user_id": created_by_user_id or MIGRATION_SYSTEM_USER_ID,
             "assigned_doctor_user_id": doctor_uuid,
-            "status": "COMPLETED",
+            "status": visit_status,
             "chief_complaint": chief_complaint,
             "complaint_duration": clean_text(duration_val, max_len=255) if duration_val else None,
-            "history_notes": None,
+            "history_notes": history_notes_val,
             "is_reconsultation": clean_consultation_type(_row_lookup(row, "New/Re-Consultation", "CONSULTATION TYPE", "Consultation Type")),
             "vitals_json": json.dumps(vitals_dict or {}, default=str),
             "created_at": visit_dt,
@@ -481,6 +500,9 @@ def transform_prescription(row: dict, visit_uuid: str, doctor_uuid: str, visit_d
             max_len=4000,
         )
         investigation_notes = []
+        invest_advised = clean_text(_row_lookup(row, "Investigations Advised", "Investigation Advised", "INVESTIGATIONS ADVISED", "Investigations", "Investigation"), max_len=2000)
+        if invest_advised:
+            investigation_notes.append(invest_advised)
         for n in range(1, 7):
             note = clean_text(_row_lookup(row, f"Test Referrals {n}", f"Test Referral {n}", f"Referral {n}"), max_len=500)
             if note:
